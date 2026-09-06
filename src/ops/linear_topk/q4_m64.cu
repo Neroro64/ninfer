@@ -9,6 +9,7 @@
 #include <cub/warp/warp_merge_sort.cuh>
 
 #include <cstdint>
+#include <cuda_bf16.h>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
