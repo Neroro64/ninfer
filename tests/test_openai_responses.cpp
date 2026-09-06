@@ -690,18 +690,13 @@ int test_explicit_rejections() {
     int failures    = 0;
 
     Json value     = base;
-    value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"strict", true}}});
+    value["text"] = Json{{"format", Json{{"type", "json_schema"}, {"name", "answer"},
+                                        {"schema", Json{{"type", "number"},
+                                                        {"multipleOf", 0.5}}}}}};
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "strict_tools_not_supported",
-                      "strict function schema is rejected explicitly");
-
-    value         = base;
-    value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+                      }) == "invalid_json_schema",
+                      "unsupported schema assertion is rejected rather than ignored");
 
     value               = base;
     value["background"] = true;
@@ -811,22 +806,33 @@ int test_previous_response_call_graph() {
 }
 
 int test_response_object() {
+    const Json format{{"type", "json_schema"}, {"name", "answer"},
+                      {"schema", Json{{"type", "object"},
+                                      {"properties", Json{{"answer", Json{{"type", "string"}}}}},
+                                      {"required", Json::array({"answer"})},
+                                      {"additionalProperties", false}}},
+                      {"strict", true}};
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(Json{{"model", "m"},
                                                    {"input", "hello"},
                                                    {"reasoning", Json{{"effort", "low"}}},
+                                                   {"text", Json{{"format", format}}},
                                                    {"store", false}},
                                               limits());
     OpenAIResponsesRuntimeValues runtime;
     runtime.temperature = 0.6F;
     runtime.top_p       = 0.95F;
+    GenerationOutcome complete = sample_outcome();
+    complete.text = R"({"answer":"yes"})";
     const BuiltOpenAIResponse built =
-        make_openai_response_object("resp_test", 123, request, runtime, sample_outcome());
+        make_openai_response_object("resp_test", 123, request, runtime, complete);
     const Json& response = built.body;
     int failures         = 0;
     failures += check(response.at("object") == "response" && response.at("status") == "completed" &&
                           response.at("completed_at").is_number_integer(),
                       "completed response has a completion timestamp");
+    failures += check(built.body.at("text").at("format") == nlohmann::json(format),
+                      "response reports the requested structured output contract");
     failures += check(response.at("max_output_tokens").is_null(),
                       "omitted output budget remains null in the response");
     failures += check(response.at("output").size() == 2 &&

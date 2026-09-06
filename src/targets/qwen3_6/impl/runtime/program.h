@@ -235,6 +235,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t root_rebuild_tail_begin = 0;
     qwen3_6::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
+    const runtime::TokenConstraint* token_constraint = nullptr;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControlPlan> vision_control_plan;
@@ -270,6 +271,7 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> {
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointDisposition::DropOptional;
     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> capture_groups;
     ops::SamplingConfig sampling;
+    const runtime::TokenConstraint* token_constraint = nullptr;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     runtime::LaneId destination{};
@@ -481,6 +483,7 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    const runtime::TokenConstraint* token_constraint = nullptr;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
     detail::PhysicalResources active_resources;
@@ -655,6 +658,14 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    std::optional<PinnedHostBuffer> dflash_draft_host;
+    TokenId* dflash_host_drafts = nullptr;
+
+    // Grammar-constraint device mask staging. Lazy: allocated on the first constrained request.
+    std::optional<PinnedHostBuffer> constraint_host;
+    // Once any request runs constrained, every decode/prefill round must re-upload the enabled
+    // columns array so stale masks from released lanes can never leak into later rounds.
+    bool constraints_active_ = false;
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
@@ -1080,6 +1091,16 @@ private:
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
+    void install_constraint(RequestControl& request, const runtime::TokenConstraint* constraint);
+    std::uint32_t* constraint_stage_words(std::size_t total_words);
+    void stage_prefill_constraints(const RequestControl& request);
+    void stage_ordinary_constraints(std::span<const std::uint32_t> lanes);
+    void stage_mtp_constraints(std::span<const std::uint32_t> lanes);
+    void stage_dflash_constraints(std::span<const std::uint32_t> lanes);
+    void stage_constraint_prefix_row(const runtime::TokenConstraint& base, std::uint32_t extent,
+                                     const TokenId* drafts, std::size_t draft_stride,
+                                     std::size_t words, std::size_t width, std::size_t row,
+                                     std::uint32_t* masks, std::uint32_t* enabled);
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();

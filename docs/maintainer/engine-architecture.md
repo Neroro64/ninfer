@@ -81,12 +81,6 @@ Frontend 拥有模型家族的输入与输出语义：
 
 - tokenizer、chat template、Vision preprocessing 和 MRoPE prompt construction；
 - owning `PreparedPrompt` 及其内容 identity；
-- stop、thinking/content channel、detokenization、最终文本和模型私有结构化输出；
-- 每个请求独占的 `OutputSession`。
-
-Frontend 可以预览一次模型输出将产生的语义效果，但只有 Engine 完成提交后才能发布该效果。
-Frontend 不拥有等待队列、cache catalog 或物理模型状态。
-
 ### 2.3 Engine
 
 Engine 是请求控制平面，拥有：
@@ -385,6 +379,17 @@ Frontend preview
 
 因此 consumer 不会看到尚未提交的 token，也不会看到与 Program frontier 不一致的 continuation。
 Forced control 使用同一提交顺序，但 token 由 Frontend 提供，不调用 sampler，也不推进 sampling RNG。
+
+### 6.4 Constrained decoding
+
+携带 `ExecutionOptions::constraint` 的请求在 `make_output_session` 编译 grammar；编译失败
+在 submit 前同步拒绝。已编译约束以 `runtime::TokenConstraint` 形态随请求发布，Program
+按只读契约消费：每轮从约束状态克隆探测生成 per-column allowed-token bitmask，经
+`apply_token_mask` Op 在采样/argmax 前写 -INF，draft/verify/correction 每列使用其
+draft-prefix 对应状态的掩码。Program 自身从不推进或回滚 grammar 状态；已提交 token
+（含 forced control token）只由 `OutputSession` 的 preview/commit 事务推进，preview 失败
+即整轮回滚。未约束 lane 的 enabled 位为零，掩码 kernel 为 no-op，未约束请求的执行路径
+与无约束时不变。
 
 ---
 

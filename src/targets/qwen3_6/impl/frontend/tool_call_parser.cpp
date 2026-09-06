@@ -96,6 +96,16 @@ ToolArgumentTypeContracts::Tool compile_tool_contract(const Json& definition) {
             contract.parameters.push_back({parameter_name, encoding});
         }
     }
+    const auto strict = function->find("strict");
+    contract.strict = strict != function->end() && strict->is_boolean() && strict->get<bool>();
+    if (contract.strict) {
+        const auto parameters = function->find("parameters");
+        contract.parameters_json =
+            parameters != function->end() && parameters->is_object() ? parameters->dump() : "{}";
+        for (ToolArgumentTypeContracts::Parameter& parameter : contract.parameters) {
+            parameter.strict_json = true;
+        }
+    }
     return contract;
 }
 
@@ -124,6 +134,11 @@ void append_tool_contract(ToolArgumentTypeContracts& contracts, const Json& defi
     if (existing->unambiguous && !same_contract(*existing, compiled)) {
         existing->parameters.clear();
         existing->unambiguous = false;
+    }
+    if (existing->strict != compiled.strict ||
+        (existing->strict && existing->parameters_json != compiled.parameters_json)) {
+        existing->strict = false;
+        existing->parameters_json.clear();
     }
 }
 
@@ -184,7 +199,18 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
     } else {
         const std::string value(remove_parameter_framing_newlines(encoded_value));
         if (contract->encoding == ToolArgumentTypeContracts::Encoding::String) {
-            args[key] = value;
+            if (contract->strict_json) {
+                // Strict sessions emit parameter values as JSON values; a framed string that
+                // already parses as a JSON string is kept verbatim so the quoted form survives.
+                Json parsed = Json::parse(value, nullptr, false);
+                if (!parsed.is_discarded() && parsed.is_string()) {
+                    args[key] = std::move(parsed);
+                } else {
+                    args[key] = value;
+                }
+            } else {
+                args[key] = value;
+            }
         } else {
             Json parsed = Json::parse(value, nullptr, false);
             if (parsed.is_discarded()) { return false; }

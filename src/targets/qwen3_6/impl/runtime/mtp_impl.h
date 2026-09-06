@@ -116,6 +116,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
 
+        Tensor constraint_masks   = frame.constraint_masks.slice(1, 0, width * batch_size);
+        Tensor constraint_enabled = frame.constraint_enabled.slice(0, 0, width * batch_size);
+        card.set_constraint_masks(&constraint_masks, &constraint_enabled);
+
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
@@ -141,6 +145,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  .selected_hidden         = selected_hidden,
                                  .replay_records          = state.execution.replay_records,
                                  .sampling                = frame.sampling,
+                                 .constraint_masks   = &constraint_masks,
+                                 .constraint_enabled = &constraint_enabled,
                              },
                              envelopes.target_verify);
 

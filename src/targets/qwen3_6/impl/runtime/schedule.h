@@ -54,6 +54,9 @@ struct PrefillContext {
     std::int32_t state_destination_slot                     = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    // RoundState prefill constraint mask pair; null when unconstrained.
+    const Tensor* constraint_masks   = nullptr;
+    const Tensor* constraint_enabled = nullptr;
 };
 
 struct OrdinaryBatchContext {
@@ -124,11 +127,17 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
+    // Step-major allowed-token masks [words, columns] and liveness flags [columns]; both null
+    // when the round is unconstrained.
+    const Tensor* constraint_masks         = nullptr;
+    const Tensor* constraint_enabled       = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
-                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent);
+                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent,
+                         const Tensor* constraint_masks   = nullptr,
+                         const Tensor* constraint_enabled = nullptr);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::CausalAttentionExecutionEnvelope envelope);
@@ -195,5 +204,17 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
+
+// Constrained rounds split the fused DFlash transaction: an eager proposal with a host readback
+// of the produced draft prefix, a host-side grammar mask pass, then eager verification under
+// per-column allowed-token masks. These entry points are never captured; unconstrained rounds
+// keep the fused captured path.
+void dflash_decode_propose_batch(DFlashBatchContext& state, std::int32_t batch_size,
+                                 std::uint32_t k, DFlashEnvelopes envelopes,
+                                 TokenId* host_drafts);
+void dflash_decode_verify_batch(DFlashBatchContext& state, std::int32_t batch_size,
+                                std::uint32_t k, DFlashEnvelopes envelopes,
+                                ops::CausalAttentionExecutionEnvelope target_envelope,
+                                bool constrained);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

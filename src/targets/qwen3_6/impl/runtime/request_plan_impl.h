@@ -255,6 +255,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->token_constraint               = options.token_constraint;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
     const std::uint32_t reserved_context_tokens =
@@ -427,7 +428,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
 
     auto plan                         = std::make_unique<AdmissionCandidateImpl>();
     plan->summary                     = base.summary;
-    plan->sampling                    = base.sampling;
+    plan->sampling                       = base.sampling;
+    plan->token_constraint               = base.token_constraint;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;

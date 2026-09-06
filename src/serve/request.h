@@ -68,6 +68,7 @@ struct ToolDefinition {
     std::string input_schema_json;
     std::optional<std::string> input_examples_json;
     bool shared_cache_boundary_after = false;
+    bool strict = false;
 };
 
 struct ToolCall {
@@ -172,6 +173,7 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool private_cache_boundary_at_prompt_end   = false;
     SamplingParams sampling;
+    std::optional<ninfer::OutputConstraint> output_constraint;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

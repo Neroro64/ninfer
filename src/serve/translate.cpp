@@ -97,7 +97,7 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
 std::string render_tool_definition(const ToolDefinition& tool) {
     using Json  = nlohmann::json;
     Json schema = Json::parse(tool.input_schema_json);
-    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", false}};
+    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
     if (!tool.description.empty()) { function["description"] = tool.description; }
     if (tool.input_examples_json) {
         function["input_examples"] = Json::parse(*tool.input_examples_json);
@@ -147,23 +147,22 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         return complete();
     }
 
+    // Wire values outside the native tier vocabulary resolve to the nearest exposed tier
+    // (minimal -> low, high/max -> xhigh) before the capability check below, so mapping
+    // never widens what the loaded template actually supports.
     switch (requested) {
+    case RequestedReasoningEffort::Minimal:
     case RequestedReasoningEffort::Low:
         result.reasoning_effort = ninfer::ReasoningEffort::Low;
         break;
     case RequestedReasoningEffort::Medium:
         result.reasoning_effort = ninfer::ReasoningEffort::Medium;
         break;
+    case RequestedReasoningEffort::High:
     case RequestedReasoningEffort::XHigh:
+    case RequestedReasoningEffort::Max:
         result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
         break;
-    case RequestedReasoningEffort::Minimal:
-    case RequestedReasoningEffort::High:
-    case RequestedReasoningEffort::Max:
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              "reasoning_effort", "reasoning_effort_not_supported");
     case RequestedReasoningEffort::None:
         break;
     }
@@ -313,6 +312,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
+    options.execution.constraint = request.output_constraint;
     if (semantics.enable_thinking) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;

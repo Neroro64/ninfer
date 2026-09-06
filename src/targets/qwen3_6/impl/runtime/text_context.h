@@ -171,6 +171,13 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
+    // Per-column allowed-token masks [words, columns] and liveness flags [columns] applied
+    // before every sampling/verify argmax this card executes. Null means unconstrained.
+    void set_constraint_masks(const Tensor* masks, const Tensor* enabled) noexcept {
+        constraint_masks_   = masks;
+        constraint_enabled_ = enabled;
+    }
+
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
@@ -325,6 +332,8 @@ private:
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
+    const Tensor* constraint_masks_             = nullptr;
+    const Tensor* constraint_enabled_           = nullptr;
     MtpW mtp_;
     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};
     std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_{};

@@ -253,7 +253,8 @@ The server supports:
 - OpenAI Responses Core with streaming and local continuation state;
 - Anthropic Messages;
 - compatible-prefix reuse;
-- prompt-rendered function tools and parsed tool calls;
+- prompt-rendered function tools and parsed tool calls, with optional strict JSON Schema
+  arguments and JSON-Schema/GBNF-constrained output;
 - bounded pending-request admission and JSONL request logs.
 
 See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).

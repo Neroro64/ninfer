@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "runtime/contract/token_constraint.h"
 #include "runtime/contract/types.h"
 
 #include <array>
@@ -110,6 +111,11 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
+    // Live output constraint behind this session; nullptr when the session is unconstrained.
+    // The published object keeps its identity for the session lifetime and reflects only
+    // committed tokens: previews advance an internal clone and commit_preview moves the
+    // accepted state into this object transactionally.
+    [[nodiscard]] const runtime::TokenConstraint* token_constraint() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
@@ -142,7 +148,8 @@ public:
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
                         const OutputOptions& output            = {},
-                        const ThinkingControlOptions& thinking = {}) const;
+                        const ThinkingControlOptions& thinking = {},
+                        const std::optional<OutputConstraint>& constraint = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:
@@ -155,5 +162,9 @@ private:
 };
 
 [[nodiscard]] Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
+// Rejects a strict tool definition ({"type":"function","function":{...,"strict":true}}) whose
+// schema cannot be enforced through the Qwen tool markup. Throws std::invalid_argument naming
+// the offending construct.
+void validate_strict_tool_json(std::string_view tool_definition_json);
 
 } // namespace ninfer::targets::qwen3_6

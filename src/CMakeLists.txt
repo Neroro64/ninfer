@@ -92,6 +92,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
   ops/launcher/target_logprobs.cu
+  ops/launcher/token_mask.cu
   ops/launcher/vision_pos_embed.cu
   # Softmax Attention and KV-cache state transitions.
   ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
@@ -272,7 +273,12 @@ add_library(ninfer_ops STATIC
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/target_logprobs.cpp
-  ops/wrapper/vision_pos_embed.cpp)
+  ops/wrapper/token_mask.cpp
+  ops/wrapper/vision_pos_embed.cpp
+  # Grammar-constrained decoding: host engine bridge over the vendored llama-grammar core.
+  ops/grammar/grammar.cpp
+  ${PROJECT_SOURCE_DIR}/third_party/llama-grammar/llama-grammar.cpp
+  ${PROJECT_SOURCE_DIR}/third_party/llama-grammar/json-schema-to-grammar.cpp)
 if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
@@ -335,6 +341,7 @@ endif()
 add_library(ninfer_engine STATIC
   targets/registry.cpp
   runtime/contract/sampling.cpp
+  runtime/contract/grammar_constraint.cpp
   runtime/engine/engine.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)

@@ -2,6 +2,7 @@
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 #include "serve/translate.h"
+#include "ninfer/ops/grammar.h"
 
 #include <nlohmann/json.hpp>
 
@@ -135,7 +136,7 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
+    rejected("response_format", Json{{"type", "audio"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -176,34 +177,55 @@ int test_standard_field_policy() {
 }
 
 int test_constrained_decoding_extensions() {
-    int failures                                           = 0;
+    int failures = 0;
+    const Json schema{{"type", "string"}, {"enum", Json::array({"yes", "no"})}};
     const std::vector<std::pair<const char*, Json>> active = {
         {"grammar", "root ::= \"yes\" | \"no\""},
-        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
-        {"guided_json", Json{{"type", "object"}}},
-        {"guided_regex", "[a-z]+"},
+        {"structured_outputs", Json{{"json", schema}}},
+        {"json_schema", schema},
+        {"guided_json", schema},
         {"guided_choice", Json::array({"yes", "no"})},
         {"guided_grammar", "root ::= \"yes\" | \"no\""},
+        {"response_format", Json{{"type", "json_schema"},
+                                 {"json_schema", Json{{"name", "answer"}, {"schema", schema},
+                                                      {"strict", true}}}}},
     };
+    std::vector<std::string> pieces;
+    for (int byte = 0; byte < 128; ++byte) { pieces.emplace_back(1, static_cast<char>(byte)); }
+    ninfer::ops::GrammarTokenTable table(std::move(pieces), {});
     for (const auto& [field, value] : active) {
-        Json body            = base_request();
-        body[field]          = value;
-        const ApiError error = api_error([&] { (void)parse(body); });
-        failures +=
-            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
-                      error.message.find(field) != std::string::npos,
-                  std::string(field) + " constrained decoding is explicitly rejected");
+        Json body = base_request();
+        body[field] = value;
+        const auto constraint = options(parse(body).generation).execution.constraint;
+        failures += check(constraint.has_value(), std::string(field) + " creates a constraint");
+        if (!constraint) { continue; }
+        auto grammar = constraint->kind == ninfer::OutputConstraint::JsonSchema
+                           ? ninfer::ops::Grammar::json_schema(constraint->text, table)
+                           : ninfer::ops::Grammar::gbnf(constraint->text, table);
+        const auto mask = grammar.allowed_mask();
+        failures += check((mask['x' / 32] & (1U << ('x' % 32))) == 0,
+                          std::string(field) + " excludes invalid answer prefix");
+        grammar.accept_bytes(constraint->kind == ninfer::OutputConstraint::JsonSchema
+                                 ? "\"yes\"" : "yes");
+        failures += check(grammar.satisfied(), std::string(field) + " permits a complete answer");
     }
-
-    Json neutral                  = base_request();
-    neutral["grammar"]            = "";
-    neutral["structured_outputs"] = nullptr;
-    neutral["guided_json"]        = nullptr;
-    neutral["guided_regex"]       = nullptr;
-    neutral["guided_choice"]      = nullptr;
-    neutral["guided_grammar"]     = nullptr;
-    failures += check(parse(neutral).generation.messages.size() == 1,
-                      "neutral constrained-decoding extension values are accepted");
+    Json body = base_request();
+    body["guided_regex"] = "[a-z]+";
+    failures += check(api_error([&] { (void)parse(body); }).code ==
+                          "constrained_decoding_not_supported", "regex remains unsupported");
+    body = base_request();
+    body["guided_choice"] = Json::array({"yes", "no"});
+    body["grammar"] = "root ::= \"yes\"";
+    failures += check(api_error([&] { (void)parse(body); }).code ==
+                          "conflicting_output_constraints", "conflicting constraints rejected");
+    body = base_request();
+    body["guided_json"] = Json{{"type", "number"}, {"multipleOf", 0.5}};
+    failures += check(api_error([&] { (void)parse(body); }).code == "invalid_json_schema",
+                      "unsupported assertion is not silently ignored");
+    body = base_request();
+    body["response_format"] = Json{{"type", "json_schema"}};
+    failures += check(api_error([&] { (void)parse(body); }).param == "response_format",
+                      "missing schema rejected before execution");
     return failures;
 }
 
@@ -276,9 +298,6 @@ int test_tools() {
                       "allowed_tools rejects names absent from the declared tool set");
 
     body          = base_request();
-    body["tools"] = Json::array({function_tool("weather", true)});
-    failures += check(api_error([&] { (void)parse(body); }).code == "strict_tools_not_supported",
-                      "strict tools rejected");
     body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
                       "custom tools rejected");

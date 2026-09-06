@@ -10,7 +10,7 @@
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
-#include <cuda_runtime.h>
+#include "runtime/contract/token_constraint.h"
 
 #include <algorithm>
 #include <array>
@@ -961,6 +961,22 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+    // Constraint mask content is only read under a nonzero enabled flag, so only the enabled
+    // columns arrays need a defined zero start.
+    CUDA_CHECK(cudaMemsetAsync(io.constraint_enabled.data, 0, io.constraint_enabled.bytes(),
+                               device.stream));
+    if (io.ordinary) {
+        CUDA_CHECK(cudaMemsetAsync(io.ordinary->constraint_enabled.data, 0,
+                                   io.ordinary->constraint_enabled.bytes(), device.stream));
+    }
+    if (io.mtp_decode) {
+        CUDA_CHECK(cudaMemsetAsync(io.mtp_decode->constraint_enabled.data, 0,
+                                   io.mtp_decode->constraint_enabled.bytes(), device.stream));
+    }
+    if (io.dflash_decode) {
+        CUDA_CHECK(cudaMemsetAsync(io.dflash_decode->constraint_enabled.data, 0,
+                                   io.dflash_decode->constraint_enabled.bytes(), device.stream));
+    }
     device.synchronize();
     prepare_graphs();
     work.reset();
@@ -8308,6 +8324,7 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     request.active_resources                    = {};
     request.optional_resources                  = {};
     request.lifecycle                           = Lifecycle::Empty;
+    request.token_constraint                    = nullptr;
     request.pending                             = {};
     continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
     active_continuations[lane]                  = continuation_capacity;
@@ -8545,6 +8562,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
     const std::uint32_t base               = staged.base;
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
     request.lifecycle                      = Lifecycle::Empty;
+    request.token_constraint               = nullptr;
     try {
         const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
         const bool preserving_source =
@@ -8967,6 +8985,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
+        install_constraint(request, request_plan.token_constraint);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
@@ -9269,6 +9288,7 @@ void ProgramImplCore::clear_execution_failure_lanes(std::span<const std::uint32_
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
+    request.token_constraint     = nullptr;
     request.pending              = {};
     request.active_resources     = {};
     request.optional_resources   = {};
@@ -10052,6 +10072,12 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                                device.stream));
 }
 
+void ProgramImplCore::install_constraint(RequestControl& request,
+                                         const runtime::TokenConstraint* constraint) {
+    request.token_constraint = constraint;
+    if (constraint != nullptr) { constraints_active_ = true; }
+}
+
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 || source.ne[0] != TextConfig::hidden || source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
@@ -10059,6 +10085,169 @@ void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
                                cudaMemcpyDeviceToDevice, device.stream));
     sequence.tail_hidden_valid = true;
+}
+
+std::uint32_t* ProgramImplCore::constraint_stage_words(std::size_t total_words) {
+    if (!constraint_host) {
+        // Sized for the widest speculative layout (DFlash) so one pinned allocation serves
+        // every staging mode.
+        const std::size_t width = kDFlashDecodeMaximumWidth;
+        const std::size_t capacity_words =
+            static_cast<std::size_t>(io.constraint_masks.ne[0]) * width * kMaximumConcurrency +
+            width * kMaximumConcurrency;
+        constraint_host.emplace(capacity_words * sizeof(std::uint32_t));
+    }
+    if (constraint_host->size() < total_words * sizeof(std::uint32_t)) {
+        throw std::logic_error("constraint staging request exceeds the pinned buffer");
+    }
+    return static_cast<std::uint32_t*>(constraint_host->data());
+}
+
+void ProgramImplCore::stage_prefill_constraints(const RequestControl& request) {
+    if (!constraints_active_) { return; }
+    const std::size_t words = static_cast<std::size_t>(io.constraint_masks.ne[0]);
+    std::uint32_t* stage = constraint_stage_words(words + 1U);
+    if (request.token_constraint == nullptr) {
+        // Mixed load: this prefill is unconstrained, so clear the single enabled column
+        // instead of letting another lane's stale mask leak into the sampling decision.
+        stage[words] = 0U;
+        CUDA_CHECK(cudaMemcpyAsync(io.constraint_enabled.data, stage + words,
+                                   sizeof(std::uint32_t), cudaMemcpyHostToDevice, device.stream));
+        return;
+    }
+    const std::vector<std::uint32_t> mask = request.token_constraint->allowed_mask();
+    if (mask.size() != words) {
+        throw std::logic_error("constraint mask width does not match the token domain");
+    }
+    std::copy(mask.begin(), mask.end(), stage);
+    stage[words] = 1U;
+    CUDA_CHECK(cudaMemcpyAsync(io.constraint_masks.data, stage, words * sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(io.constraint_enabled.data, stage + words, sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice, device.stream));
+}
+
+void ProgramImplCore::stage_ordinary_constraints(std::span<const std::uint32_t> lanes) {
+    if (!constraints_active_ || !io.ordinary) { return; }
+    qwen3_6::OrdinaryDecodeState& frame = *io.ordinary;
+    const std::size_t words = static_cast<std::size_t>(frame.constraint_masks.ne[0]);
+    const std::size_t batch = static_cast<std::size_t>(frame.constraint_masks.ne[1]);
+    std::uint32_t* stage   = constraint_stage_words(words * batch + batch);
+    std::uint32_t* enabled = stage + words * batch;
+    std::fill(enabled, enabled + batch, 0U);
+    bool any = false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const RequestControl& request = requests[lanes[row]];
+        if (request.token_constraint == nullptr) { continue; }
+        any = true;
+        const std::vector<std::uint32_t> mask = request.token_constraint->allowed_mask();
+        if (mask.size() != words) {
+            throw std::logic_error("constraint mask width does not match the token domain");
+        }
+        std::copy(mask.begin(), mask.end(), stage + row * words);
+        enabled[row] = 1U;
+    }
+    if (any) {
+        CUDA_CHECK(cudaMemcpyAsync(frame.constraint_masks.data, stage,
+                                   words * batch * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                                   device.stream));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(frame.constraint_enabled.data, enabled,
+                               batch * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
+void ProgramImplCore::stage_constraint_prefix_row(const runtime::TokenConstraint& base,
+                                                  std::uint32_t extent, const TokenId* drafts,
+                                                  std::size_t draft_stride, std::size_t words,
+                                                  std::size_t width, std::size_t row,
+                                                  std::uint32_t* masks, std::uint32_t* enabled) {
+    // Verify logits flatten to [vocab, width * lanes] with batch-major columns, so lane
+    // `row` at draft step `step` owns flat verify column `step + width * row`. One
+    // column's mask words are contiguous, matching the token-mask kernel's per-column
+    // word blocks at `masks + column * words + word`.
+    const std::unique_ptr<runtime::TokenConstraint> probe = base.clone();
+    std::vector<std::uint32_t> mask = probe->allowed_mask();
+    if (mask.size() != words) {
+        throw std::logic_error("constraint mask width does not match the token domain");
+    }
+    const auto write_column = [&](std::size_t step) {
+        const std::size_t column = step + width * row;
+        std::copy(mask.begin(), mask.end(), masks + column * words);
+        enabled[column] = 1U;
+    };
+    write_column(0);
+    for (std::size_t step = 0; step + 1U < width && step < extent; ++step) {
+        const TokenId draft = drafts[step * draft_stride];
+        const std::size_t word = static_cast<std::size_t>(draft) / 32U;
+        const std::uint32_t bit = 1U << (static_cast<std::uint32_t>(draft) % 32U);
+        if (word >= words || (mask[word] & bit) == 0U) {
+            // The verification chain rejects at this column, so all later columns of the row
+            // stay disabled; rejected prefixes never contaminate the committed state because
+            // the probe is a clone.
+            break;
+        }
+        probe->accept(draft);
+        mask = probe->allowed_mask();
+        write_column(step + 1);
+    }
+}
+
+void ProgramImplCore::stage_mtp_constraints(std::span<const std::uint32_t> lanes) {
+    qwen3_6::MtpDecodeState& frame = *io.mtp_decode;
+    const std::size_t words   = static_cast<std::size_t>(frame.constraint_masks.ne[0]);
+    const std::size_t columns = static_cast<std::size_t>(frame.constraint_masks.ne[1]);
+    std::uint32_t* stage   = constraint_stage_words(words * columns + columns);
+    std::uint32_t* enabled = stage + words * columns;
+    std::fill(enabled, enabled + columns, 0U);
+    bool any = false;
+    const std::size_t width = static_cast<std::size_t>(draft_window) + 1U;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const RequestControl& request = requests[lanes[row]];
+        if (request.token_constraint == nullptr) { continue; }
+        any = true;
+        const SequenceState& sequence = active_sequence(lanes[row]);
+        const std::uint32_t extent =
+            static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
+        stage_constraint_prefix_row(*request.token_constraint, extent,
+                                    sequence.mtp_drafts.data(), 1U, words, width, row, stage,
+                                    enabled);
+    }
+    if (any) {
+        CUDA_CHECK(cudaMemcpyAsync(frame.constraint_masks.data, stage,
+                                   words * columns * sizeof(std::uint32_t),
+                                   cudaMemcpyHostToDevice, device.stream));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(frame.constraint_enabled.data, enabled,
+                               columns * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
+void ProgramImplCore::stage_dflash_constraints(std::span<const std::uint32_t> lanes) {
+    if (!constraints_active_ || !io.dflash_decode || dflash_host_drafts == nullptr) { return; }
+    qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
+    const std::size_t words    = static_cast<std::size_t>(frame.constraint_masks.ne[0]);
+    const std::size_t columns = static_cast<std::size_t>(frame.constraint_masks.ne[1]);
+    const std::size_t width    = static_cast<std::size_t>(draft_window) + 1U;
+    const std::size_t active   = lanes.size();
+    std::uint32_t* stage   = constraint_stage_words(words * columns + columns);
+    std::uint32_t* enabled = stage + words * columns;
+    std::fill(enabled, enabled + columns, 0U);
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const RequestControl& request = requests[lanes[row]];
+        if (request.token_constraint == nullptr) { continue; }
+        const std::uint32_t extent =
+            static_cast<std::uint32_t>(dflash_host_ingress->proposal_extents[row]);
+        // Drafts arrive from the propose readback in [k, active] step-major order.
+        stage_constraint_prefix_row(*request.token_constraint, extent, dflash_host_drafts + row,
+                                    active, words, width, row, stage, enabled);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(frame.constraint_masks.data, stage,
+                               words * columns * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                               device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(frame.constraint_enabled.data, enabled,
+                               columns * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                               device.stream));
 }
 
 void ProgramImplCore::copy_round_token() {
@@ -10176,6 +10365,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
+        stage_prefill_constraints(request);
         schedule::PrefillContext schedule_state{
             {device, model, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -10192,7 +10382,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             selectors.source,
             selectors.destination,
             staged.initial_mtp_extent,
-            dflash_host_ingress};
+            dflash_host_ingress,
+            &io.constraint_masks,
+            &io.constraint_enabled};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -10495,6 +10687,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
+        stage_ordinary_constraints(lanes);
 
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                        replay_records ? &*replay_records : nullptr,
@@ -10644,6 +10837,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                     std::min(capacity, frontier + extent + draft_window));
         }
 
+        stage_mtp_constraints(lanes);
+
         schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head},
@@ -10671,7 +10866,6 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::int32_t accepted_i = mtp_host_egress->accepted_drafts[row];
             const std::int32_t next_i     = mtp_host_egress->next_extents[row];
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
-                accepted_i + 1 != count_i || next_i < 0 ||
                 next_i > static_cast<std::int32_t>(draft_window) ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
                 static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
@@ -10830,8 +11024,32 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.dflash_round);
-        schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      draft_window, envelopes, target_envelope, executable);
+        const bool constrained_round =
+            std::any_of(lanes.begin(), lanes.end(), [this](std::uint32_t lane) {
+                return requests[lane].token_constraint != nullptr;
+            });
+        if (constrained_round) {
+            // Constrained rounds leave the fused captured path: eager proposal with a host
+            // readback of the draft prefix, host-side grammar staging, then eager verification
+            // under per-column masks.
+            if (!dflash_draft_host) {
+                dflash_draft_host.emplace(sizeof(TokenId) *
+                                          static_cast<std::size_t>(kDFlashDecodeMaximumDrafts) *
+                                          kMaximumConcurrency);
+                dflash_host_drafts = static_cast<TokenId*>(dflash_draft_host->data());
+            }
+            schedule::dflash_decode_propose_batch(schedule_state,
+                                                  static_cast<std::int32_t>(lanes.size()),
+                                                  draft_window, envelopes, dflash_host_drafts);
+            device.synchronize();
+            stage_dflash_constraints(lanes);
+            schedule::dflash_decode_verify_batch(schedule_state,
+                                                 static_cast<std::int32_t>(lanes.size()),
+                                                 draft_window, envelopes, target_envelope, true);
+        } else {
+            schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                          draft_window, envelopes, target_envelope, executable);
+        }
         timing.begin_wait();
         device.synchronize();
         timing.end_wait();

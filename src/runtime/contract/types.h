@@ -154,6 +154,8 @@ private:
     bool finished_                     = false;
 };
 
+class TokenConstraint;
+
 // Engine has already selected the registered model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
@@ -161,6 +163,11 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // Request-level presentation constraint forwarded to the frontend session constructor.
+    std::optional<OutputConstraint> constraint;
+    // Compiled constraint owned by the request's OutputSession; non-owning view for the
+    // Program sampler. Null when unconstrained. The Program must not outlive it.
+    const class TokenConstraint* token_constraint = nullptr;
 };
 
 struct ResolvedRequestOptions {

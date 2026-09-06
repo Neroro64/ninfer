@@ -2,10 +2,13 @@
 
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <ninfer/ops/grammar.h>
+#include <runtime/contract/token_constraint.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
+#include "targets/qwen3_6/impl/frontend/strict_tool_grammar.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 #include "targets/qwen3_6/impl/frontend/tool_call_parser.h"
@@ -21,6 +24,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -28,6 +32,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace ninfer::targets::qwen3_6 {
 namespace {
@@ -827,6 +833,117 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
     return out;
 }
 
+template <std::size_t Size>
+consteval std::array<std::size_t, Size> make_prefix_failure_table(std::string_view pattern) {
+    std::array<std::size_t, Size> failure{};
+    for (std::size_t index = 1; index < Size; ++index) {
+        std::size_t matched = failure[index - 1U];
+        while (matched != 0 && pattern[index] != pattern[matched]) {
+            matched = failure[matched - 1U];
+        }
+        if (pattern[index] == pattern[matched]) { ++matched; }
+        failure[index] = matched;
+    }
+    return failure;
+}
+
+constexpr auto kThinkCloseFailure =
+    make_prefix_failure_table<kThinkClose.size()>(kThinkClose);
+
+// Reasoning-phase view of the domain: every regular token stays legal, end-of-generation ids
+// stay stoppable, and specials outside the stop set are never candidates.
+std::vector<std::uint32_t>
+unconstrained_reasoning_mask(const ops::GrammarTokenTable& table) {
+    const std::size_t vocabulary      = table.n_vocab();
+    std::vector<std::uint32_t> mask((vocabulary + 31U) / 32U, 0U);
+    const std::vector<std::string>& pieces = table.pieces();
+    const std::size_t piece_bound = std::min(pieces.size(), mask.size() * 32U);
+    for (std::size_t id = 0; id < piece_bound; ++id) {
+        if (!pieces[id].empty()) { mask[id / 32U] |= 1U << (id % 32U); }
+    }
+    for (const TokenId token : table.eog()) {
+        const auto id = static_cast<std::size_t>(token);
+        if (id < vocabulary) { mask[id / 32U] |= 1U << (id % 32U); }
+    }
+    return mask;
+}
+
+// Concrete constraint over one output session. The reasoning channel is unconstrained; the
+// first committed bytes after the thinking boundary seed the grammar, and every later token is
+// advanced through it. Cloning snapshots the channel phase together with the grammar state, so
+// speculative branches and preview rollbacks never disturb the committed base.
+class GrammarTokenConstraint final : public runtime::TokenConstraint {
+public:
+    GrammarTokenConstraint(ops::Grammar grammar,
+                           std::shared_ptr<const ops::GrammarTokenTable> table,
+                           std::vector<std::uint32_t> reasoning_mask, bool in_reasoning)
+        : grammar_(std::move(grammar)), table_(std::move(table)),
+          reasoning_mask_(std::move(reasoning_mask)), in_reasoning_(in_reasoning) {}
+
+    // The interface deletes its copy operations, but cloning needs a member-wise copy that
+    // default-constructs the base.
+    GrammarTokenConstraint(GrammarTokenConstraint&& other) noexcept
+        : grammar_(std::move(other.grammar_)), table_(std::move(other.table_)),
+          reasoning_mask_(std::move(other.reasoning_mask_)),
+          in_reasoning_(other.in_reasoning_), matched_(other.matched_) {}
+
+    GrammarTokenConstraint& operator=(GrammarTokenConstraint&& other) noexcept {
+        grammar_        = std::move(other.grammar_);
+        table_          = std::move(other.table_);
+        reasoning_mask_ = std::move(other.reasoning_mask_);
+        in_reasoning_   = other.in_reasoning_;
+        matched_        = other.matched_;
+        return *this;
+    }
+    GrammarTokenConstraint(const GrammarTokenConstraint& other)
+        : grammar_(other.grammar_), table_(other.table_),
+          reasoning_mask_(other.reasoning_mask_), in_reasoning_(other.in_reasoning_),
+          matched_(other.matched_) {}
+
+    [[nodiscard]] std::unique_ptr<runtime::TokenConstraint> clone() const override {
+        return std::unique_ptr<runtime::TokenConstraint>(new GrammarTokenConstraint(*this));
+    }
+
+    void accept(TokenId token) override {
+        if (token < 0 || static_cast<std::size_t>(token) >= table_->n_vocab()) {
+            throw std::invalid_argument("output constraint received a token outside the token "
+                                        "domain: " +
+                                        std::to_string(token));
+        }
+        const std::string_view bytes = table_->pieces()[static_cast<std::size_t>(token)];
+        if (bytes.empty()) { return; } // specials are never candidates and carry no bytes
+        if (!in_reasoning_) {
+            grammar_.accept_bytes(bytes);
+            return;
+        }
+        for (std::size_t offset = 0; offset < bytes.size(); ++offset) {
+            const char byte = bytes[offset];
+            while (matched_ != 0 && byte != kThinkClose[matched_]) {
+                matched_ = kThinkCloseFailure[matched_ - 1U];
+            }
+            if (byte == kThinkClose[matched_]) { ++matched_; }
+            if (matched_ != kThinkClose.size()) { continue; }
+            in_reasoning_ = false;
+            matched_      = 0;
+            if (offset + 1U < bytes.size()) {
+                grammar_.accept_bytes(bytes.substr(offset + 1U));
+            }
+            return;
+        }
+    }
+
+    [[nodiscard]] std::vector<std::uint32_t> allowed_mask() const override {
+        return in_reasoning_ ? reasoning_mask_ : grammar_.allowed_mask();
+    }
+
+private:
+    ops::Grammar grammar_;
+    std::shared_ptr<const ops::GrammarTokenTable> table_;
+    std::vector<std::uint32_t> reasoning_mask_;
+    bool in_reasoning_ = false;
+    std::size_t matched_ = 0;
+};
+
 } // namespace
 
 class Frontend::Impl {
@@ -901,6 +1018,29 @@ public:
     bool vision_enabled                         = true;
     std::uint32_t max_context                   = 0;
     std::uint32_t max_cache_markers_per_request = 0;
+    // Immutable per-piece vocabulary view for constraint compilation. Built once, lazily, so
+    // unconstrained sessions never pay for the copy.
+    [[nodiscard]] const std::shared_ptr<const ops::GrammarTokenTable>& grammar_table() const {
+        std::call_once(grammar_table_once_, [this] {
+            const std::size_t vocabulary = tokenizer->vocabulary_size();
+            std::vector<std::string> pieces(vocabulary);
+            for (std::size_t id = 0; id < vocabulary; ++id) {
+                const auto token = static_cast<int>(id);
+                if (tokenizer->is_valid_token(token) && !tokenizer->is_special_token(token)) {
+                    pieces[id] = std::string(tokenizer->decode_token_bytes(token));
+                }
+            }
+            grammar_table_ = std::make_shared<const ops::GrammarTokenTable>(
+                std::move(pieces),
+                std::vector<TokenId>(tokenizer->default_stop_token_ids().begin(),
+                                     tokenizer->default_stop_token_ids().end()));
+        });
+        return grammar_table_;
+    }
+
+private:
+    mutable std::once_flag grammar_table_once_;
+    mutable std::shared_ptr<const ops::GrammarTokenTable> grammar_table_;
 };
 
 class OutputSession::Impl {
@@ -908,13 +1048,15 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
-         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
+         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
+         std::unique_ptr<runtime::TokenConstraint> constraint_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
-                           output.tool_name_max_length) {
+                           output.tool_name_max_length),
+          constraint(std::move(constraint_)) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -938,6 +1080,8 @@ public:
     PublishedOutput preview_output;
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
+    std::unique_ptr<runtime::TokenConstraint> constraint;
+    std::unique_ptr<runtime::TokenConstraint> preview_constraint;
     bool preview_ready = false;
 };
 
@@ -1040,6 +1184,8 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     impl_->preview_state    = impl_->state;
     impl_->preview_semantic = impl_->semantic;
     impl_->preview_output.clear();
+    impl_->preview_constraint =
+        impl_->constraint != nullptr ? impl_->constraint->clone() : nullptr;
 
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
@@ -1054,6 +1200,13 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         const std::uint32_t count          = static_cast<std::uint32_t>(index + 1);
         const TokenId token                = tokens[index];
         const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        if (impl_->preview_constraint != nullptr) {
+            try {
+                impl_->preview_constraint->accept(token);
+            } catch (const std::runtime_error&) {
+                throw std::logic_error("generated round violates the active output constraint");
+            }
+        }
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         if (impl_->preview_semantic.in_reasoning) {
@@ -1149,9 +1302,18 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_state    = impl_->state;
     impl_->preview_semantic = impl_->semantic;
     impl_->preview_output.clear();
+    impl_->preview_constraint =
+        impl_->constraint != nullptr ? impl_->constraint->clone() : nullptr;
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenId token                = tokens[index];
         const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        if (impl_->preview_constraint != nullptr) {
+            try {
+                impl_->preview_constraint->accept(token);
+            } catch (const std::runtime_error&) {
+                throw std::logic_error("generated round violates the active output constraint");
+            }
+        }
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         const std::string_view presentation_bytes =
@@ -1201,6 +1363,8 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_semantic                 = impl_->semantic;
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
+    impl_->preview_constraint =
+        impl_->constraint != nullptr ? impl_->constraint->clone() : nullptr;
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     impl_->preview_ready = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
@@ -1211,6 +1375,13 @@ PublishedOutput OutputSession::commit_preview() {
     using std::swap;
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);
+    if (impl_->constraint != nullptr) {
+        // The published object keeps its identity: Program may hold token_constraint() across
+        // rounds, so the advanced preview state moves into it instead of swapping pointers.
+        static_cast<GrammarTokenConstraint&>(*impl_->constraint) =
+            std::move(static_cast<GrammarTokenConstraint&>(*impl_->preview_constraint));
+    }
+    impl_->preview_constraint.reset();
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
@@ -1220,6 +1391,7 @@ PublishedOutput OutputSession::commit_preview() {
             delta.text = impl_->tool_call_output.feed(delta.text);
         }
     }
+
     if (impl_->state.terminal) {
         fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
         impl_->tool_calls                            = std::move(terminal.tool_calls);
@@ -1488,15 +1660,73 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
-                                            const ThinkingControlOptions& thinking) const {
+                                            const ThinkingControlOptions& thinking,
+                                            const std::optional<OutputConstraint>& constraint) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    const fi::ToolArgumentTypeContracts* contract =
+        prompt.data_->tool_call_output != nullptr
+            ? &prompt.data_->tool_call_output->argument_types
+            : nullptr;
+    const bool has_strict_tools =
+        contract != nullptr && std::any_of(contract->tools.begin(), contract->tools.end(),
+                                           [](const fi::ToolArgumentTypeContracts::Tool& tool) {
+                                               return tool.strict;
+                                           });
+    std::unique_ptr<runtime::TokenConstraint> compiled;
+    if (constraint.has_value() || has_strict_tools) {
+        if (output.raw) {
+            throw std::invalid_argument("raw output sessions cannot apply an output constraint");
+        }
+        if (has_strict_tools) {
+            for (const fi::ToolArgumentTypeContracts::Tool& tool : contract->tools) {
+                if (!tool.strict) { continue; }
+                fi::validate_strict_contract_tool(tool);
+                if (tool.name.size() > output.tool_name_max_length) {
+                    throw std::invalid_argument(
+                        "strict tool name '" + tool.name + "' exceeds output.tool_name_max_length");
+                }
+            }
+        }
+        std::string constraint_rules;
+        if (constraint.has_value()) {
+            switch (constraint->kind) {
+            case OutputConstraint::JsonSchema:
+                constraint_rules = fi::convert_output_constraint_schema(constraint->text);
+                break;
+            case OutputConstraint::Gbnf:
+                constraint_rules = constraint->text;
+                break;
+            default:
+                throw std::invalid_argument("output constraint kind is invalid");
+            }
+        }
+        const std::string grammar_text = fi::compose_output_grammar(contract, constraint_rules);
+        const std::shared_ptr<const ops::GrammarTokenTable>& table = impl_->grammar_table();
+        ops::Grammar grammar = [&]() {
+            try {
+                return ops::Grammar::gbnf(grammar_text, *table);
+            } catch (const std::runtime_error& error) {
+                throw std::invalid_argument(std::string("output constraint grammar failed to "
+                                                        "compile: ") +
+                                            error.what());
+            }
+        }();
+        compiled = std::make_unique<GrammarTokenConstraint>(
+            std::move(grammar), table, unconstrained_reasoning_mask(*table),
+            prompt.data_->starts_in_reasoning);
+    }
+
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens, prompt.data_->tool_call_output));
+        impl_->thinking_control_tokens, prompt.data_->tool_call_output, std::move(compiled)));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+
+const runtime::TokenConstraint* OutputSession::token_constraint() const noexcept {
+    return impl_ != nullptr ? impl_->constraint.get() : nullptr;
+}
 
 } // namespace ninfer::targets::qwen3_6
