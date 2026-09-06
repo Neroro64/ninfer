@@ -23,6 +23,8 @@ struct RoundStateSpec {
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
+    // Constraint-mask words per token-domain column; 0 allocates no constraint regions.
+    std::uint32_t mask_words     = 0;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -100,6 +102,10 @@ struct OrdinaryDecodeStateLayout {
     LayoutRegion egress;
     TensorRegion logits;
     TensorRegion hidden;
+    // Per-column allowed-token masks ([mask_words, batch]) and liveness flags ([batch]);
+    // both empty unless spec.mask_words != 0.
+    TensorRegion constraint_masks;
+    TensorRegion constraint_enabled;
 };
 
 struct MtpPrefillStateLayout {
@@ -131,6 +137,9 @@ struct MtpDecodeStateLayout {
     TensorRegion ar_positions;
     TensorRegion ar_rope_positions;
     TensorRegion ar_valid_columns;
+    // Step-major over (draft_window + 1) * batch columns; empty unless mask_words != 0.
+    TensorRegion constraint_masks;
+    TensorRegion constraint_enabled;
 };
 
 struct DFlashDecodeStateLayout {
@@ -149,6 +158,9 @@ struct DFlashDecodeStateLayout {
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    // Step-major over (draft_window + 1) * batch columns; empty unless mask_words != 0.
+    TensorRegion constraint_masks;
+    TensorRegion constraint_enabled;
 };
 
 struct RoundStateLayout {
@@ -161,6 +173,9 @@ struct RoundStateLayout {
     TensorRegion logits;
     TensorRegion text_kv_table_row;
     TensorRegion backend_kv_table_row;
+    // Prefill sampling mask pair ([mask_words, 1] / [1]); empty unless mask_words != 0.
+    TensorRegion constraint_masks;
+    TensorRegion constraint_enabled;
     std::optional<MtpPrefillStateLayout> mtp;
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
@@ -181,6 +196,8 @@ struct OrdinaryDecodeState {
     Tensor sampled_tokens;
     Tensor logits;
     Tensor hidden;
+    Tensor constraint_masks;
+    Tensor constraint_enabled;
 
     OrdinaryDecodeState() = default;
     OrdinaryDecodeState(DeviceSpan backing, const OrdinaryDecodeStateLayout& layout,
@@ -247,6 +264,8 @@ struct MtpDecodeState {
     Tensor ar_positions;
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
+    Tensor constraint_masks;
+    Tensor constraint_enabled;
 
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
@@ -285,6 +304,8 @@ struct DFlashDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    Tensor constraint_masks;
+    Tensor constraint_enabled;
 
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
@@ -300,6 +321,8 @@ struct RoundState {
     Tensor logits;
     Tensor text_kv_table_row;
     Tensor backend_kv_table_row;
+    Tensor constraint_masks;
+    Tensor constraint_enabled;
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;

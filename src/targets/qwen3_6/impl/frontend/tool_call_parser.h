@@ -40,12 +40,19 @@ struct ToolCallOutputContract {
         std::string name;
         NormalizationPolicy policy = NormalizationPolicy::Legacy;
         TypeSet types;
+        // Strict-only: a framed value that parses as a JSON string is emitted verbatim instead
+        // of raw-escaped. Non-strict normalization is bit-identical to the legacy behavior.
+        bool strict_json = false;
     };
 
     struct Tool {
         std::string name;
         std::vector<Parameter> parameters;
         bool unambiguous = true;
+        // function.strict=true tools carry their parameters schema for constraint compilation;
+        // two conflicting strict definitions of one name degrade to a non-strict tool.
+        bool strict             = false;
+        std::string parameters_json;
     };
 
     std::vector<Tool> tools;

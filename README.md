@@ -215,7 +215,8 @@ All registered model IDs support:
 - private and shared exact-prefix reuse with Device/Host State and KV retention;
 - model-aware sampling defaults and explicit sampler overrides;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
-  tools, local response state, token counting, and usage accounting.
+  tools with optional strict JSON Schema arguments, JSON-Schema/GBNF-constrained output, local
+  response state, token counting, and usage accounting.
 
 The 35B-A3B target additionally supports DFlash with draft windows from one to fifteen for Text and
 image/video Vision prompts. Qwen3.8-27B artifacts with the DFlash2 companion weights support

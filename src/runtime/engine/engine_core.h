@@ -198,8 +198,11 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            auto output = instance_.loaded->frontend.make_output_session(
-                prompt, options.stop, options.output, options.execution.thinking);
+            auto output =
+                instance_.loaded->frontend.make_output_session(prompt, options.stop, options.output,
+                                                               options.execution.thinking,
+                                                               options.execution.constraint);
+            options.execution.token_constraint = output.token_constraint();
             const std::uint32_t capacity_output =
                 max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
             try {

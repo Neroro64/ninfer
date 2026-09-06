@@ -85,7 +85,9 @@ Frontend 拥有模型家族的输入与输出语义：
 
 - tokenizer、chat template、Vision preprocessing 和 MRoPE prompt construction；
 - owning `PreparedPrompt` 及其内容 identity；
-- stop、thinking/content channel、detokenization、最终文本和模型私有结构化输出；
+- 请求级 output constraint（JSON Schema / GBNF）的编译与 token 级语义：grammar 状态由
+  `OutputSession` 独占推进，仅约束 content channel（reasoning 在 `</think>` 前自由），
+  strict tool 参数区域与显式 response format 通过同一 grammar 引擎合成；
 - model output 中可由历史 renderer 精确重建的 prefix-execution boundary；
 - 每个请求独占的 `OutputSession`。
 
@@ -422,6 +424,17 @@ Frontend 产生的 boundary metadata 只描述当前 accepted span 内的相对�
 对应 row 搬运，不解释 delimiter，也不修改 resident identity。Program 使用 pending row 的 base frontier
 转换为绝对位置，并与 accepted token、Main/backend state 及 prefix digest 原子提交。Program commit 失败时，
 `OutputSession` 的 preview state 同样不提交；ordinary、MTP、DFlash 和 forced control 共享这一所有权链。
+
+### 6.4 Constrained decoding
+
+携带 `ExecutionOptions::constraint` 的请求在 `make_output_session` 编译 grammar；编译失败
+在 submit 前同步拒绝。已编译约束以 `runtime::TokenConstraint` 形态随请求发布，Program
+按只读契约消费：每轮从约束状态克隆探测生成 per-column allowed-token bitmask，经
+`apply_token_mask` Op 在采样/argmax 前写 -INF，draft/verify/correction 每列使用其
+draft-prefix 对应状态的掩码。Program 自身从不推进或回滚 grammar 状态；已提交 token
+（含 forced control token）只由 `OutputSession` 的 preview/commit 事务推进，preview 失败
+即整轮回滚。未约束 lane 的 enabled 位为零，掩码 kernel 为 no-op，未约束请求的执行路径
+与无约束时不变。
 
 ---
 

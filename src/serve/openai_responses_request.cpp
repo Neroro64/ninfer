@@ -710,12 +710,9 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
         if (!item.at("strict").is_boolean()) {
             bad_request("function strict must be a boolean", "tools");
         }
-        if (item.at("strict").get<bool>()) {
-            bad_request("strict function schema enforcement requires constrained decoding, "
-                        "which the Engine does not provide",
-                        "tools", "strict_tools_not_supported");
-        }
+        parsed.definition.strict = item.at("strict").get<bool>();
     }
+    if (parsed.definition.strict) { validate_strict_tool_schema(parameters.dump()); }
     if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
         if (!item.at("defer_loading").is_boolean()) {
             bad_request("function defer_loading must be a boolean", "tools");
@@ -941,22 +938,14 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     out.generation.reasoning_effort = *effort;
 }
 
-void parse_text(const Json& body) {
+void parse_text(const Json& body, GenerationRequest& generation) {
     if (!body.contains("text") || body.at("text").is_null()) { return; }
     const Json& text = body.at("text");
     if (!text.is_object()) { bad_request("text must be an object", "text"); }
     static const std::unordered_set<std::string> allowed = {"format", "verbosity"};
     reject_nonnull_unknown_members(text, allowed, "text");
     if (text.contains("format") && !text.at("format").is_null()) {
-        const Json& format = text.at("format");
-        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
-            bad_request("text.format must be a typed object", "text");
-        }
-        if (format.at("type").get<std::string>() != "text" || format.size() != 1) {
-            bad_request("structured text output requires constrained decoding, which the Engine "
-                        "does not provide",
-                        "text", "structured_outputs_not_supported");
-        }
+        generation.output_constraint = parse_output_format(text.at("format"), "text.format", true);
     }
     if (text.contains("verbosity") && !text.at("verbosity").is_null()) {
         if (!text.at("verbosity").is_string()) {
@@ -1049,7 +1038,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
                     "parallel_tool_calls", "parallel_tool_calls_not_supported");
     }
     parse_reasoning(body, out.prompt);
-    parse_text(body);
+    parse_text(body, out.prompt.generation);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
     out.prompt.generation.max_tokens = limits.default_max_tokens;
@@ -1172,6 +1161,15 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     out.tool_choice         = std::move(parsed.wire_tool_choice);
     out.tool_identities     = std::move(parsed.tool_identities);
     out.parallel_tool_calls = parsed.parallel_tool_calls;
+    if (body.contains("text") && !body.at("text").is_null()) {
+        const auto& text = body.at("text");
+        if (text.contains("format") && !text.at("format").is_null()) {
+            out.text["format"] = text.at("format");
+        }
+        if (text.contains("verbosity") && !text.at("verbosity").is_null()) {
+            out.text["verbosity"] = text.at("verbosity");
+        }
+    }
     out.store               = optional_bool(body, "store", true);
     out.stream              = optional_bool(body, "stream", false);
     validate_metadata(body, out.metadata);

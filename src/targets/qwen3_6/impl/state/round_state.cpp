@@ -65,6 +65,22 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             add_tensor(builder, DType::BF16,
                        {spec.hidden, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
                        "ordinary decode hidden");
+        if (spec.mask_words != 0) {
+            const auto words =
+                checked_i32(spec.mask_words, "RoundState mask words exceed int32");
+            ordinary.constraint_masks   = add_tensor(
+                builder, DType::I32, {words, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
+                "ordinary constraint masks");
+            ordinary.constraint_enabled = add_tensor(
+                builder, DType::I32, {checked_i32(spec.batch_capacity, "RoundState batch capacity")},
+                "ordinary constraint enabled");
+        }
+    }
+    if (spec.mask_words != 0) {
+        const auto words = checked_i32(spec.mask_words, "RoundState mask words exceed int32");
+        layout.constraint_masks =
+            add_tensor(builder, DType::I32, {words, 1}, "step constraint masks");
+        layout.constraint_enabled = add_tensor(builder, DType::I32, {1}, "step constraint enabled");
     }
     layout.token      = add_tensor(builder, DType::I32, {1}, "step token");
     layout.pos        = add_tensor(builder, DType::I32, {1}, "step position");
@@ -108,6 +124,10 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                             DType::I32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
+    if (layout.constraint_masks.region.bytes != 0) {
+        constraint_masks   = layout.constraint_masks.bind(backing);
+        constraint_enabled = layout.constraint_enabled.bind(backing);
+    }
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -170,6 +190,15 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                               "MTP decode autoregressive rope positions");
         decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive valid columns");
+        if (layout.spec.mask_words != 0) {
+            const auto words =
+                checked_i32(layout.spec.mask_words, "RoundState mask words exceed int32");
+            decode.constraint_masks =
+                add_tensor(builder, DType::I32, {words, columns * batch},
+                           "MTP decode constraint masks");
+            decode.constraint_enabled = add_tensor(builder, DType::I32, {columns * batch},
+                                                   "MTP decode constraint enabled");
+        }
     }
     if (is_masked_draft_backend(layout.spec.backend)) {
         layout.dflash_prefill.emplace().produced_count = i32(1, "DFlash prefill produced count");
@@ -208,6 +237,15 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
+        if (layout.spec.mask_words != 0) {
+            const auto words =
+                checked_i32(layout.spec.mask_words, "RoundState mask words exceed int32");
+            decode.constraint_masks =
+                add_tensor(builder, DType::I32, {words, columns * batch},
+                           "DFlash decode constraint masks");
+            decode.constraint_enabled = add_tensor(builder, DType::I32, {columns * batch},
+                                                   "DFlash decode constraint enabled");
+        }
     }
     layout.complete = true;
 }
@@ -291,6 +329,10 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     ar_positions               = layout.ar_positions.bind(backing);
     ar_rope_positions          = layout.ar_rope_positions.bind(backing);
     ar_valid_columns           = layout.ar_valid_columns.bind(backing);
+    if (layout.constraint_masks.region.bytes != 0) {
+        constraint_masks   = layout.constraint_masks.bind(backing);
+        constraint_enabled = layout.constraint_enabled.bind(backing);
+    }
     if (ar_positions.ne[0] != batch || ar_positions.ne[1] != steps) {
         throw std::logic_error("MTP decode AR layout does not match its configured dimensions");
     }
@@ -361,6 +403,10 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_logits              = layout.target_logits.bind(backing);
     target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+    if (layout.constraint_masks.region.bytes != 0) {
+        constraint_masks   = layout.constraint_masks.bind(backing);
+        constraint_enabled = layout.constraint_enabled.bind(backing);
+    }
 }
 
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
@@ -375,6 +421,10 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     logits               = layout.logits.bind(backing);
     text_kv_table_row    = layout.text_kv_table_row.bind(backing);
     backend_kv_table_row = layout.backend_kv_table_row.bind(backing);
+    if (layout.constraint_masks.region.bytes != 0) {
+        constraint_masks   = layout.constraint_masks.bind(backing);
+        constraint_enabled = layout.constraint_enabled.bind(backing);
+    }
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
     if (layout.dflash_prefill) { dflash_prefill.emplace(backing, *layout.dflash_prefill); }
     if (layout.mtp_decode) {

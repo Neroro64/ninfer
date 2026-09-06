@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/token_mask.h"
 #include "ninfer/ops/scatter.h"
 
 #include <stdexcept>
@@ -40,6 +41,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    state_destinations, envelope, hidden, logits);
         ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
                      state.execution.device.stream);
+        Tensor constraint_masks   = ordinary.constraint_masks.slice(1, 0, batch_size);
+        Tensor constraint_enabled = ordinary.constraint_enabled.slice(0, 0, batch_size);
+        ops::apply_token_mask(logits, constraint_masks, constraint_enabled,
+                              TextConfig::token_domain, state.execution.device.stream);
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,

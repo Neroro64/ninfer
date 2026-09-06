@@ -89,6 +89,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
   ops/launcher/target_logprobs.cu
+  ops/launcher/token_mask.cu
   ops/launcher/vision_pos_embed.cu
   ops/rmsnorm_rope/rmsnorm_rope.cpp
   ops/rmsnorm_rope/launch.cu
@@ -304,7 +305,12 @@ add_library(ninfer_ops STATIC
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/target_logprobs.cpp
-  ops/wrapper/vision_pos_embed.cpp)
+  ops/wrapper/token_mask.cpp
+  ops/wrapper/vision_pos_embed.cpp
+  # Grammar-constrained decoding: host engine bridge over the vendored llama-grammar core.
+  ops/grammar/grammar.cpp
+  ${PROJECT_SOURCE_DIR}/third_party/llama-grammar/llama-grammar.cpp
+  ${PROJECT_SOURCE_DIR}/third_party/llama-grammar/json-schema-to-grammar.cpp)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
@@ -350,6 +356,7 @@ endif()
 add_library(ninfer_engine STATIC
   targets/registry.cpp
   runtime/contract/sampling.cpp
+  runtime/contract/grammar_constraint.cpp
   runtime/engine/engine.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)

@@ -212,11 +212,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
 
     out.round = qwen3_6::begin_round_state_layout(
-        builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
-                                         .output_rows    = TextConfig::output_rows,
-                                         .batch_capacity = plan.max_concurrency,
-                                         .draft_window   = plan.draft_window,
-                                         .backend        = plan.speculative_backend});
+        builder,
+        qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
+                                .output_rows    = TextConfig::output_rows,
+                                .batch_capacity = plan.max_concurrency,
+                                .draft_window   = plan.draft_window,
+                                .backend        = plan.speculative_backend,
+                                .mask_words     = (TextConfig::token_domain + 31U) / 32U});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     if (plan.causal_scoring) {

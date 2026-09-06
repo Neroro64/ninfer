@@ -26,6 +26,7 @@
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/token_mask.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -744,6 +745,10 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        if (constraint_masks_ != nullptr && constraint_enabled_ != nullptr) {
+            ops::apply_token_mask(flat_logits, *constraint_masks_, *constraint_enabled_,
+                                  kCfg.token_domain, stream);
+        }
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();
@@ -1195,6 +1200,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);
+                if (constraint_masks_ != nullptr && constraint_enabled_ != nullptr) {
+                    ops::apply_token_mask(logits, *constraint_masks_, *constraint_enabled_,
+                                          kCfg.token_domain, s);
+                }
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

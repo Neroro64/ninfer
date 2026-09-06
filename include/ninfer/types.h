@@ -244,11 +244,25 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> budget;
 };
 
+// Presentation-level output constraint compiled by the target frontend and enforced by the
+// runtime sampler. JsonSchema text is a JSON Schema document; Gbnf text is a GBNF grammar
+// document. The frontend rejects unsupported constructs at submission time.
+struct OutputConstraint {
+    enum Kind : std::uint8_t {
+        JsonSchema,
+        Gbnf,
+    };
+
+    Kind kind = JsonSchema;
+    std::string text;
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    std::optional<OutputConstraint> constraint;
 };
 
 struct OutputOptions {

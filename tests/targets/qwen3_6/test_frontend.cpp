@@ -2201,6 +2201,307 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+bool mask_allows(const std::vector<std::uint32_t>& mask, ninfer::TokenId token) {
+    return (mask[static_cast<std::size_t>(token) / 32U] >> (token % 32U)) & 1U;
+}
+
+ninfer::PromptInput plain_input(bool enable_thinking) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = enable_thinking;
+    return input;
+}
+
+int test_explicit_json_constraint() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    auto prompt             = frontend.prepare(plain_input(false));
+    ninfer::OutputConstraint constraint{
+        .kind = ninfer::OutputConstraint::JsonSchema,
+        .text = R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"],"additionalProperties":false})"};
+    auto session = frontend.make_output_session(prompt, {}, {}, {}, constraint);
+    int failures = 0;
+    const ninfer::runtime::TokenConstraint* published = session.token_constraint();
+    failures += check(published != nullptr, "explicit constraint did not publish a constraint");
+    if (published == nullptr) { return failures; }
+    const auto mask = published->allowed_mask();
+    failures += check(mask.size() == (fixture_tokenizer().vocabulary_size() + 31U) / 32U,
+                      "constraint mask word count does not cover the token domain");
+    failures += check(((mask.back() >> (fixture_tokenizer().vocabulary_size() % 32U)) == 0U),
+                      "constraint mask sets bits past the token domain");
+    // Thinking is disabled, so content is constrained from the first sampled token.
+    failures += check(mask_allows(mask, fixture_byte_token('{')) &&
+                          mask_allows(mask, fixture_byte_token(' ')),
+                      "JSON constraint rejected the opening object token");
+    failures += check(!mask_allows(mask, fixture_byte_token('x')) && !mask_allows(mask, 1) &&
+                          !mask_allows(mask, 6),
+                      "JSON constraint allowed tokens outside the schema prefix");
+
+    // Preview advances a clone: the published snapshot moves only at commit time.
+    const auto before_mask                      = published->allowed_mask();
+    const std::vector<ninfer::TokenId> value    = fixture_tokenizer().encode("{\"a\":1}");
+    const auto decision                         = session.preview_model(
+        value, static_cast<std::uint32_t>(value.size() + 1U), ninfer::FinishReason::OutputLimit);
+    failures += check(decision.accepted_tokens == value.size(),
+                      "constraint session rejected the schema-valid JSON round");
+    failures += check(before_mask == published->allowed_mask(),
+                      "preview advanced the published constraint before commit");
+    (void)session.commit_preview();
+    const auto committed = published->allowed_mask();
+    failures += check(mask_allows(committed, 6),
+                      "complete JSON value did not admit end-of-generation");
+    failures += check(!mask_allows(committed, fixture_byte_token('{')),
+                      "complete JSON value still admitted additional content");
+
+    bool rejected = false;
+    try {
+        (void)session.preview_model(std::array<ninfer::TokenId, 1>{fixture_byte_token('x')}, 3,
+                                    ninfer::FinishReason::OutputLimit);
+    } catch (const std::logic_error&) { rejected = true; }
+    failures += check(rejected, "constraint session accepted a schema-violating round");
+
+    const auto eos_decision = session.preview_model(
+        std::array<ninfer::TokenId, 1>{6}, 2, ninfer::FinishReason::OutputLimit);
+    failures += check(eos_decision.accepted_tokens == 1 &&
+                          eos_decision.finish_reason == ninfer::FinishReason::StopToken,
+                      "constraint session did not stop on the admitted end-of-generation token");
+    (void)session.commit_preview();
+
+    ninfer::OutputConstraint broken{.kind = ninfer::OutputConstraint::JsonSchema,
+                                    .text = R"({"not":{}})"};
+    bool rejected_schema = false;
+    try {
+        (void)frontend.make_output_session(prompt, {}, {}, {}, broken);
+    } catch (const std::invalid_argument&) { rejected_schema = true; }
+    failures += check(rejected_schema, "invalid schema compiled into an output constraint");
+    return failures;
+}
+
+int test_constraint_reasoning_channel() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    auto prompt             = frontend.prepare(plain_input(true));
+    int failures            = 0;
+
+    auto session = frontend.make_output_session(
+        prompt, {}, {}, {},
+        ninfer::OutputConstraint{.kind = ninfer::OutputConstraint::JsonSchema,
+                                 .text = R"({"type":"string"})"});
+    const ninfer::runtime::TokenConstraint* published = session.token_constraint();
+    const auto reasoning_mask                         = published->allowed_mask();
+    failures += check(mask_allows(reasoning_mask, fixture_byte_token('x')) &&
+                          mask_allows(reasoning_mask, 1) && mask_allows(reasoning_mask, 6),
+                      "reasoning phase did not stay unconstrained");
+    failures += check(!mask_allows(reasoning_mask, 248053),
+                      "reasoning phase admitted a non-terminal special token");
+
+    // A token that closes the phase and carries violating content bytes is rejected exactly at
+    // the boundary span.
+    auto crossing = frontend.make_output_session(
+        prompt, {}, {}, {},
+        ninfer::OutputConstraint{.kind = ninfer::OutputConstraint::JsonSchema,
+                                 .text = R"({"type":"string"})"});
+    bool rejected = false;
+    try {
+        (void)crossing.preview_model(std::array<ninfer::TokenId, 2>{3, 4}, 3,
+                                     ninfer::FinishReason::OutputLimit);
+    } catch (const std::logic_error&) { rejected = true; }
+    failures += check(rejected, "content past the thinking boundary escaped the constraint");
+
+    const std::vector<ninfer::TokenId> close_round = fixture_tokenizer().encode("thought");
+    std::vector<ninfer::TokenId> round             = close_round;
+    round.push_back(248069);
+    const std::vector<ninfer::TokenId> gap = fixture_tokenizer().encode("\n\n");
+    round.insert(round.end(), gap.begin(), gap.end());
+    const auto decision = session.preview_model(
+        round, static_cast<std::uint32_t>(round.size() + 1U), ninfer::FinishReason::OutputLimit);
+    failures += check(decision.accepted_tokens == round.size(),
+                      "thinking close round was not accepted");
+    (void)session.commit_preview();
+    const auto content_mask = published->allowed_mask();
+    failures += check(!mask_allows(content_mask, fixture_byte_token('x')) &&
+                          mask_allows(content_mask, fixture_byte_token('"')),
+                      "content phase did not switch to the grammar mask");
+
+    const std::vector<ninfer::TokenId> text = fixture_tokenizer().encode("\"done\"");
+    (void)session.preview_model(text, static_cast<std::uint32_t>(text.size() + 1U),
+                                ninfer::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    failures += check(mask_allows(published->allowed_mask(), 6),
+                      "complete string content did not admit end-of-generation");
+
+    // Forced close through the thinking budget also advances the constraint channel.
+    auto forced = frontend.make_output_session(
+        prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 1},
+        ninfer::OutputConstraint{.kind = ninfer::OutputConstraint::JsonSchema,
+                                 .text = R"({"type":"string"})"});
+    const std::vector<ninfer::TokenId> first = fixture_tokenizer().encode("thought");
+    const auto pending_decision =
+        forced.preview_model(std::span<const ninfer::TokenId>(first).first(1U), 10,
+                             ninfer::FinishReason::OutputLimit);
+    failures += check(pending_decision.continuation ==
+                              ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                      "thinking budget did not schedule the forced close");
+    (void)forced.commit_preview();
+    failures += check(!forced.pending_control_tokens().empty(),
+                      "committed control request did not expose the pending span");
+    (void)forced.preview_control(forced.pending_control_tokens(), 9);
+    (void)forced.commit_preview();
+    const auto forced_mask = forced.token_constraint()->allowed_mask();
+    failures += check(!mask_allows(forced_mask, fixture_byte_token('x')) &&
+                          mask_allows(forced_mask, fixture_byte_token('"')),
+                      "forced close did not move the constraint into content mode");
+    return failures;
+}
+
+int test_strict_tool_constraint() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    ninfer::PromptInput input = plain_input(false);
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"get_weather","description":"w","strict":true,"parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"],"additionalProperties":false}}})");
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"log_event","parameters":{"type":"object","properties":{"note":{"type":"string"}}}}})");
+    auto prompt  = frontend.prepare(std::move(input));
+    int failures = 0;
+
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+    const ninfer::runtime::TokenConstraint* published = session.token_constraint();
+    failures += check(published != nullptr, "strict tools did not publish a constraint");
+    if (published == nullptr) { return failures; }
+    // Tool calls stay optional: plain replies and end-of-generation remain legal.
+    const auto mask = published->allowed_mask();
+    failures += check(mask_allows(mask, 6) && mask_allows(mask, 1) &&
+                          mask_allows(mask, fixture_byte_token('<')),
+                      "strict tool constraint broke ordinary text replies");
+
+    const std::vector<ninfer::TokenId> reply = fixture_tokenizer().encode("Sure.");
+    (void)session.preview_model(reply, static_cast<std::uint32_t>(reply.size() + 1U),
+                                ninfer::FinishReason::OutputLimit);
+    auto output = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "Sure.",
+                      "strict tool session altered the plain reply");
+
+    const std::string call =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\n\"D\xc3\xbcsseldorf\"\n"
+        "</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> call_tokens = fixture_tokenizer().encode(call);
+    (void)session.preview_model(call_tokens,
+                                static_cast<std::uint32_t>(call_tokens.size() + 1U),
+                                ninfer::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    const auto call_eos = session.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
+                                                ninfer::FinishReason::OutputLimit);
+    failures += check(call_eos.finish_reason == ninfer::FinishReason::StopToken,
+                      "strict tool session did not stop after the complete call");
+    (void)session.commit_preview();
+    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+    failures += check(calls.size() == 1 && calls.front().name == "get_weather",
+                      "strict tool call did not parse");
+    if (calls.size() == 1) {
+        const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
+        failures += check(arguments.at("city") == "D\xc3\xbcsseldorf" && arguments.at("days") == 3,
+                          "strict quoted-string normalization lost the argument value");
+    }
+
+    auto invalid = frontend.make_output_session(prompt, {}, {});
+    bool rejected = false;
+    const std::string missing_required =
+        "<tool_call>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n</function>\n"
+        "</tool_call>";
+    try {
+        const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(missing_required);
+        (void)invalid.preview_model(tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
+                                    ninfer::FinishReason::OutputLimit);
+    } catch (const std::logic_error&) { rejected = true; }
+    failures += check(rejected, "strict constraint accepted a call missing its required member");
+    auto undeclared = frontend.make_output_session(prompt, {}, {});
+    rejected        = false;
+    try {
+        const std::vector<ninfer::TokenId> tokens =
+            fixture_tokenizer().encode("<tool_call>\n<function=hr_block>\n");
+        (void)undeclared.preview_model(tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
+                                       ninfer::FinishReason::OutputLimit);
+    } catch (const std::logic_error&) { rejected = true; }
+    failures += check(rejected, "strict constraint accepted an undeclared tool name");
+
+    auto mixed = frontend.make_output_session(prompt, {}, {});
+    const std::string nonstrict_call =
+        "<tool_call>\n<function=log_event>\n<parameter=note>\nhello <raw> & \"stuff\"\n"
+        "</parameter>\n<parameter=extra>\n7\n</parameter>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> mixed_tokens = fixture_tokenizer().encode(nonstrict_call);
+    (void)mixed.preview_model(mixed_tokens,
+                              static_cast<std::uint32_t>(mixed_tokens.size() + 1U),
+                              ninfer::FinishReason::OutputLimit);
+    (void)mixed.commit_preview();
+    (void)mixed.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
+                              ninfer::FinishReason::OutputLimit);
+    (void)mixed.commit_preview();
+    const std::vector<ninfer::GeneratedToolCall> mixed_calls = mixed.take_tool_calls();
+    failures += check(mixed_calls.size() == 1 && mixed_calls.front().name == "log_event",
+                      "non-strict tool call was not preserved under a mixed tool set");
+    if (mixed_calls.size() == 1) {
+        const nlohmann::json arguments = nlohmann::json::parse(mixed_calls.front().arguments_json);
+        failures += check(arguments.at("note") == "hello <raw> & \"stuff\"" &&
+                              arguments.at("extra") == 7,
+                          "non-strict tool semantics changed under a mixed tool set");
+    }
+    failures += check(mixed.tool_call_parse_diagnostics().schema_mismatch_arguments == 1,
+                      "non-strict undeclared parameter did not keep its mismatch diagnostic");
+
+    bool rejected_length = false;
+    try {
+        (void)frontend.make_output_session(prompt, {},
+                                           ninfer::OutputOptions{.tool_name_max_length = 4});
+    } catch (const std::invalid_argument&) { rejected_length = true; }
+    failures += check(rejected_length,
+                      "strict tool name ignored output.tool_name_max_length");
+    return failures;
+}
+
+int test_gbnf_constraint_and_validator() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    auto prompt             = frontend.prepare(plain_input(false));
+    int failures            = 0;
+
+    auto session = frontend.make_output_session(
+        prompt, {}, {}, {},
+        ninfer::OutputConstraint{.kind = ninfer::OutputConstraint::Gbnf,
+                                 .text = "root ::= \"ok\" \"!\""});
+    const auto mask = session.token_constraint()->allowed_mask();
+    failures += check(mask_allows(mask, fixture_byte_token('o')) &&
+                          !mask_allows(mask, fixture_byte_token('x')),
+                      "GBNF constraint mask did not follow the grammar prefix");
+    const std::vector<ninfer::TokenId> ok = fixture_tokenizer().encode("ok!");
+    (void)session.preview_model(ok, static_cast<std::uint32_t>(ok.size() + 1U),
+                                ninfer::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    failures += check(mask_allows(session.token_constraint()->allowed_mask(), 6),
+                      "GBNF constraint did not admit end-of-generation after completion");
+
+    bool rejected = false;
+    try {
+        ninfer::targets::qwen3_6::validate_strict_tool_json(
+            R"({"type":"function","function":{"name":"a","strict":true,"parameters":{"type":"object","properties":{},"required":["missing"]}}})");
+    } catch (const std::invalid_argument&) { rejected = true; }
+    failures += check(rejected, "validator accepted a required name outside properties");
+    rejected = false;
+    try {
+        ninfer::targets::qwen3_6::validate_strict_tool_json(
+            R"({"type":"function","function":{"name":"a","strict":true,"parameters":{"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":true}}})");
+    } catch (const std::invalid_argument&) { rejected = true; }
+    failures += check(rejected, "validator accepted additionalProperties at the markup surface");
+    bool accepted = true;
+    try {
+        ninfer::targets::qwen3_6::validate_strict_tool_json(
+            R"({"type":"function","function":{"name":"a","strict":true,"parameters":{"type":"object","properties":{"a":{"type":["string","null"]}},"required":["a"],"additionalProperties":false}}})");
+    } catch (const std::invalid_argument&) { accepted = false; }
+    failures += check(accepted, "validator rejected an expressible strict tool schema");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -2246,5 +2547,9 @@ int main() {
     failures += test_media_preparation_cancellation();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
+    failures += test_explicit_json_constraint();
+    failures += test_constraint_reasoning_channel();
+    failures += test_strict_tool_constraint();
+    failures += test_gbnf_constraint_and_validator();
     return failures == 0 ? 0 : 1;
 }

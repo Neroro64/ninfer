@@ -187,6 +187,14 @@ Contract::Tool compile_tool_contract(const Json& definition) {
         }
         contract.parameters.push_back(std::move(parameter));
     }
+    const auto strict = function->find("strict");
+    contract.strict = strict != function->end() && strict->is_boolean() && strict->get<bool>();
+    if (contract.strict) {
+        const auto parameters = function->find("parameters");
+        contract.parameters_json =
+            parameters != function->end() && parameters->is_object() ? parameters->dump() : "{}";
+        for (Contract::Parameter& parameter : contract.parameters) { parameter.strict_json = true; }
+    }
     return contract;
 }
 
@@ -216,6 +224,11 @@ void append_tool_contract(Contract& contracts, const Json& definition) {
     if (existing->unambiguous && !same_contract(*existing, compiled)) {
         existing->parameters.clear();
         existing->unambiguous = false;
+    }
+    if (existing->strict != compiled.strict ||
+        (existing->strict && existing->parameters_json != compiled.parameters_json)) {
+        existing->strict = false;
+        existing->parameters_json.clear();
     }
 }
 
@@ -372,9 +385,21 @@ bool admits_value(TypeSet types, JsonValueKind kind) {
 
 std::string encode_json_string(std::string_view value) { return Json(std::string(value)).dump(); }
 
-NormalizedParameter normalize_declared_parameter(std::string_view encoded_value, TypeSet types) {
+NormalizedParameter normalize_declared_parameter(std::string_view encoded_value, TypeSet types,
+                                                 bool strict_json) {
     const std::string_view framed = remove_parameter_framing_newlines(encoded_value);
     if (admits_type(types, SchemaType::String)) {
+        if (strict_json) {
+            // Strict sessions emit parameter values as JSON values; a framed string that
+            // already parses as a JSON string is kept verbatim so the quoted form survives.
+            const std::string_view value = trim_format_whitespace(framed);
+            JsonValueKind kind;
+            if (!value.empty() && classify_json_value(value, kind) &&
+                kind == JsonValueKind::String) {
+                return {.disposition = ParameterNormalization::Emitted,
+                        .json_value  = std::string(value)};
+            }
+        }
         return {.json_value = encode_json_string(framed)};
     }
 
@@ -399,7 +424,8 @@ NormalizedParameter normalize_declared_parameter(std::string_view encoded_value,
 NormalizedParameter normalize_parameter(std::string_view encoded_value,
                                         const Contract::Parameter* parameter) {
     if (parameter != nullptr && parameter->policy == NormalizationPolicy::DeclaredTypes) {
-        return normalize_declared_parameter(encoded_value, parameter->types);
+        return normalize_declared_parameter(encoded_value, parameter->types,
+                                            parameter->strict_json);
     }
 
     const std::string_view value = trim_format_whitespace(encoded_value);

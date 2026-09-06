@@ -87,6 +87,10 @@ public:
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
+    // Total id space [0, vocabulary_size()); most ids may still be invalid.
+    [[nodiscard]] std::size_t vocabulary_size() const noexcept {
+        return decoded_token_bytes_.size();
+    }
 
 private:
     std::vector<std::string> decoded_token_bytes_;

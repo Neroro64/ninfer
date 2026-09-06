@@ -3,6 +3,7 @@
 
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/token_mask.h"
 #include "ninfer/ops/scalar.h"
 
 #include <cuda_runtime.h>
@@ -34,11 +35,13 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
-                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
+                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent,
+                         const Tensor* constraint_masks, const Tensor* constraint_enabled) {
     card.set_sampling(sampling);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
+    card.set_constraint_masks(constraint_masks, constraint_enabled);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -58,7 +61,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+                        state.state_destination_slot, state.mtp_proposal_extent,
+                        state.constraint_masks, state.constraint_enabled);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -81,7 +85,8 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+                        state.state_destination_slot, state.mtp_proposal_extent,
+                        state.constraint_masks, state.constraint_enabled);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -142,6 +147,10 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
+    if (state.constraint_masks != nullptr && state.constraint_enabled != nullptr) {
+        ops::apply_token_mask(logits, *state.constraint_masks, *state.constraint_enabled,
+                              TextConfig::token_domain, state.execution.device.stream);
+    }
     ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);

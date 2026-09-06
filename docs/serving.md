@@ -108,7 +108,7 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
-- `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
+- `response_format` `{"type":"text"}`, `{"type":"json_object"}`, and `{"type":"json_schema"}`;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
@@ -122,14 +122,17 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, `strict:true`, required or named tool choice,
-`parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
-moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
-Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
-Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
-`guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
-as unknown hints.
+behavior. This includes nonzero `logit_bias`, requested log probabilities, audio/file input or
+audio output, required or named tool choice, `parallel_tool_calls:false` with enabled tools,
+explicit low/high image detail, web search, moderation, low/high verbosity, stored Chat
+Completions, and non-empty legacy `functions`. Each capability rejection identifies the affected
+field and the guarantee NInfer cannot provide.
+
+Constrained-decoding aliases (`grammar`, `json_schema`, `structured_outputs`, `guided_json`,
+`guided_choice`, and `guided_grammar`) compile to the same grammar engine as `response_format`.
+`guided_regex` remains rejected (`constrained_decoding_not_supported`): there is no public
+regex-to-grammar entry. Specifying more than one active constraint returns
+`conflicting_output_constraints`.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
@@ -167,7 +170,8 @@ case-insensitive boolean text is normalized to `true` or `false`. A nonempty sch
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
 supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
-properties, perform recursive JSON Schema validation, or use constrained decoding.
+properties, or perform recursive JSON Schema validation for non-strict tools. A strict tool
+instead constrains generation with its declared schema (see [Structured output](#structured-output)).
 
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
@@ -189,9 +193,10 @@ does not match the model-held endpoint and can reuse only an earlier exact check
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
-`medium`, and `xhigh`; omitting effort uses that template's declared default. An explicit effort
-not exposed by the loaded template returns HTTP 400 with code
-`reasoning_effort_not_supported` before prompt preparation.
+`medium`, and `xhigh`; omitting effort uses that template's declared default. Protocol effort
+values outside that tier set resolve to the nearest exposed tier first (`minimal` to `low`,
+`high` and `max` to `xhigh`). A request whose resolved tier the loaded template does not expose
+returns HTTP 400 with code `reasoning_effort_not_supported` before prompt preparation.
 
 `--default-thinking-budget N` sets a positive process default for requests whose final resolved
 prompt semantics enable thinking. It does not add or reinterpret an HTTP request field: the
@@ -215,10 +220,10 @@ post-close model token, preparation is rejected with HTTP 400 code
 not promise that the model will emit nonempty content or a tool call after the marker.
 
 For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
-select the corresponding template effort when available. The other OpenAI protocol values
-`minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
-`enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
-`reasoning_effort` returns `conflicting_template_option`.
+select the corresponding template effort when available, and `minimal`, `high`, and `max` map to
+the nearest exposed tier (`low`, `xhigh`, and `xhigh`) before the loaded template's effort
+capability is checked. `enable_thinking` controls the same new-turn thinking switch; a
+contradictory combination with `reasoning_effort` returns `conflicting_template_option`.
 
 `preserve_thinking` controls whether reasoning from closed assistant turns remains in later
 prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
@@ -231,6 +236,31 @@ finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a
 and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
 supported.
+
+### Structured output
+
+Constrained output uses the vendored llama.cpp GBNF grammar engine. A schema is accepted only
+when the converter can express it exactly; unsupported assertions (`patternProperties`,
+`multipleOf` on non-integers, overlapping `oneOf`, `not`/`if`/`then`/`else`, and similar) return
+HTTP 400 `invalid_json_schema` naming the construct instead of being silently ignored. Supported
+coverage includes objects with `properties`/`required`/`additionalProperties`, arrays with
+`items`/`prefixItems` and length bounds, `enum`/`const`, `$ref`/`$defs`, `anyOf`, disjoint
+`oneOf`, `allOf`, integer and numeric bounds, `minLength`/`maxLength`, and the `date-time`,
+`date`, `time`, `uri`, and `email` string formats. `json_object` maps to `{"type":"object"}`.
+
+The constraint applies to the content channel only. On a thinking request, reasoning stays free
+until the model emits `</think>` (or a thinking-budget early close), after which content tokens
+are grammar-constrained; a non-thinking request is constrained from the first generated token.
+An explicit response format and `strict:true` tools are mutually exclusive content grammars and
+are rejected together.
+
+`strict:true` function tools (all three protocols) constrain each argument value region with the
+parameter's schema through the same engine: required properties must be emitted, undeclared
+properties are excluded when `additionalProperties` is `false`, and strict string values are
+generated as JSON-quoted values inside the Qwen `<parameter>` markup. The top-level parameters
+schema must be a flat object (`properties`/`required`); deeper nesting follows ordinary schema
+support. Tool-call markup, call ordering, and whether a call is emitted at all remain
+model-driven under `tool_choice:auto`.
 
 ### llama.cpp-compatible request observations
 
@@ -413,7 +443,7 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
-| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects the corresponding exposed effort; `minimal` maps to `low` and `high`/`max` map to `xhigh` before the loaded template's capability check |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -516,10 +546,11 @@ undeclared model output remains ordinary text. `allowed_tools` with mode `auto` 
 without changing declaration order, while `tool_choice:"none"` disables structured tool output even
 when the history contains earlier calls.
 
-NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
-`strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
-tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
-invocation are also rejected because their semantics cannot be honored.
+NInfer does not execute functions. `strict:true` constrains each declared function's arguments
+with its schema through the shared grammar engine; required or named tool choice, hosted tools,
+remote MCP tools, and custom free-form tools are still rejected. Deferred loading, output schemas,
+and caller restrictions that exclude direct invocation are also rejected because their semantics
+cannot be honored.
 
 ### Response object and usage
 
@@ -685,12 +716,12 @@ before closing the block. Request lowering reconstructs the local prompt from th
 remains usable across serve restarts.
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
-closed-turn Qwen reasoning history. `output_config.effort` is checked against the loaded template's
-declared effort capability.
+closed-turn Qwen reasoning history. `output_config.effort` resolves through the shared
+protocol-to-tier mapping before the loaded template's declared effort capability is checked.
 
-User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
-`input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
-`strict:true`, active single-call enforcement, deferred tools, tools that exclude direct model
+User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
+`strict:true` schema-constrained arguments. `tool_choice:auto` and `none` are executable. Forced
+or named choice, active single-call enforcement, deferred tools, tools that exclude direct model
 calls, Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their
 required constraint or executor is absent. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
@@ -1005,8 +1036,8 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+responses. NInfer does not execute tools; strict tool schemas and structured output formats are
+enforced through grammar-constrained decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

@@ -23,6 +23,14 @@ ServeOptions parse(std::vector<std::string> arguments) {
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
 }
 
+template <typename Function>
+std::string api_code(Function&& function) {
+    try {
+        function();
+    } catch (const ApiException& exception) { return exception.error().code; }
+    return "no exception";
+}
+
 } // namespace
 
 int main() {
@@ -284,6 +292,76 @@ int main() {
         check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::Low &&
                   explicit_effort.effective_reasoning_effort == ninfer::ReasoningEffort::Low,
               "explicit reasoning effort did not remain the effective effort");
+    // Wire-only effort values resolve to the nearest exposed tier before the template
+    // capability check, so a mapped tier the template lacks is still rejected.
+    request.reasoning_effort = RequestedReasoningEffort::Minimal;
+    const auto minimal_effort = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures += check(minimal_effort.reasoning_effort == ninfer::ReasoningEffort::Low &&
+                          minimal_effort.effective_reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "minimal reasoning effort did not map to the low tier");
+    request.reasoning_effort = RequestedReasoningEffort::High;
+    const auto high_effort = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures += check(high_effort.reasoning_effort == ninfer::ReasoningEffort::XHigh &&
+                          high_effort.effective_reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "high reasoning effort did not map to the xhigh tier");
+    request.reasoning_effort = RequestedReasoningEffort::Max;
+    const auto max_effort = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures += check(max_effort.reasoning_effort == ninfer::ReasoningEffort::XHigh &&
+                          max_effort.effective_reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "max reasoning effort did not map to the xhigh tier");
+    request.reasoning_effort = RequestedReasoningEffort::XHigh;
+    const auto xhigh_effort = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures += check(xhigh_effort.reasoning_effort == ninfer::ReasoningEffort::XHigh &&
+                          xhigh_effort.effective_reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "native xhigh reasoning effort did not remain the effective effort");
+    request.reasoning_effort = RequestedReasoningEffort::None;
+    const auto none_effort = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures += check(!none_effort.enable_thinking && !none_effort.effective_reasoning_effort,
+                      "none reasoning effort did not disable thinking");
+
+    request.reasoning_effort  = RequestedReasoningEffort::Minimal;
+    request.enable_thinking   = false;
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(request, defaults, prompt_capabilities);
+                      }) == "conflicting_template_option",
+                      "a thinking-enabling effort coexisted with disabled thinking");
+    request.enable_thinking  = true;
+    request.reasoning_effort = RequestedReasoningEffort::None;
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(request, defaults, prompt_capabilities);
+                      }) == "conflicting_template_option",
+                      "a thinking-disabling effort coexisted with enabled thinking");
+    request.enable_thinking.reset();
+
+    ninfer::PromptCapabilities toggle_only;
+    toggle_only.enable_thinking = true;
+    for (const RequestedReasoningEffort effort :
+         {RequestedReasoningEffort::Minimal, RequestedReasoningEffort::Low,
+          RequestedReasoningEffort::Medium, RequestedReasoningEffort::High,
+          RequestedReasoningEffort::XHigh, RequestedReasoningEffort::Max}) {
+        request.reasoning_effort = effort;
+        failures += check(api_code([&] {
+                              (void)resolve_prompt_semantics(request, defaults, toggle_only);
+                          }) == "reasoning_effort_not_supported",
+                          "an effort request widened a thinking-toggle-only template");
+    }
+    request.reasoning_effort = RequestedReasoningEffort::None;
+    failures += check(!resolve_prompt_semantics(request, defaults, toggle_only).enable_thinking,
+                      "none effort did not disable thinking on a toggle-only template");
+
+    ninfer::PromptCapabilities without_xhigh;
+    without_xhigh.enable_thinking         = true;
+    without_xhigh.reasoning_effort.low    = true;
+    without_xhigh.reasoning_effort.medium = true;
+    request.reasoning_effort              = RequestedReasoningEffort::Max;
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(request, defaults, without_xhigh);
+                      }) == "reasoning_effort_not_supported",
+                      "max effort mapped past a template without the xhigh tier");
+    request.reasoning_effort = RequestedReasoningEffort::Medium;
+    failures += check(resolve_prompt_semantics(request, defaults, without_xhigh).reasoning_effort ==
+                          ninfer::ReasoningEffort::Medium,
+                      "a native medium effort was rejected by a medium-capable template");
     request.reasoning_effort.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
@@ -296,6 +374,7 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
     failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
