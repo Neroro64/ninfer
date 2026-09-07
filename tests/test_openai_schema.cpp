@@ -210,6 +210,25 @@ int test_constrained_decoding_extensions() {
         failures += check(grammar.satisfied(), std::string(field) + " permits a complete answer");
     }
     Json body = base_request();
+    const Json nullable_item = {
+        {"type", Json::array({"array", "null"})},
+        {"items", Json{{"type", "string"}}},
+    };
+    const Json nullable_object = {
+        {"type", Json::array({"object", "null"})},
+        {"properties", Json{{"items", nullable_item}}},
+        {"required", Json::array({"items"})},
+        {"additionalProperties", false},
+    };
+    body["response_format"] = Json{
+        {"type", "json_schema"},
+        {"json_schema", Json{{"name", "nullable_record"}, {"schema", nullable_object}, {"strict", true}}},
+    };
+    const OpenAIChatRequest nullable_request = parse(body);
+    failures += check(nullable_request.generation.output_constraint.has_value(),
+                      "nullable object and array schema creates a constraint");
+
+    body = base_request();
     body["guided_regex"] = "[a-z]+";
     failures += check(api_error([&] { (void)parse(body); }).code ==
                           "constrained_decoding_not_supported", "regex remains unsupported");

@@ -1,6 +1,7 @@
 #include "json-schema-to-grammar.h"
 
 #include <algorithm>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <optional>
@@ -1385,6 +1386,43 @@ public:
         return false;
     }
 
+    static void erase_union_type_specific_keywords(json & schema, const std::initializer_list<const char *> & keys) {
+        for (const char * key : keys) {
+            schema.erase(key);
+        }
+    }
+
+    static json schema_for_union_type(const json & schema, const std::string & type) {
+        json branch = schema;
+        branch["type"] = type;
+
+        if (type != "object") {
+            erase_union_type_specific_keywords(
+                branch,
+                {"properties", "required", "additionalProperties", "patternProperties", "propertyNames",
+                 "dependentSchemas", "dependentRequired", "dependencies", "minProperties", "maxProperties",
+                 "unevaluatedProperties"}
+            );
+        }
+        if (type != "array") {
+            erase_union_type_specific_keywords(
+                branch,
+                {"items", "prefixItems", "additionalItems", "minItems", "maxItems", "contains", "minContains",
+                 "maxContains", "uniqueItems", "unevaluatedItems"}
+            );
+        }
+        if (type != "string") {
+            erase_union_type_specific_keywords(branch, {"pattern", "minLength", "maxLength", "format"});
+        }
+        if (type != "integer" && type != "number") {
+            erase_union_type_specific_keywords(
+                branch,
+                {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"}
+            );
+        }
+        return branch;
+    }
+
     std::string visit(const json & schema, const std::string & name) {
         json schema_type = schema.contains("type") ? schema["type"] : json();
         std::string schema_format = schema.contains("format") && schema["format"].is_string()
@@ -1435,9 +1473,11 @@ public:
         if (schema_type.is_array()) {
             std::vector<json> schema_types;
             for (const auto & t : schema_type) {
-                json schema_copy(schema);
-                schema_copy["type"] = t;
-                schema_types.push_back(schema_copy);
+                if (!t.is_string()) {
+                    _errors.push_back("Schema type union entries must be strings: " + schema.dump());
+                    continue;
+                }
+                schema_types.push_back(schema_for_union_type(schema, t.get<std::string>()));
             }
             return _add_rule(rule_name, _generate_union_rule(name, schema_types));
         }

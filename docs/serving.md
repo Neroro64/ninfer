@@ -213,6 +213,7 @@ coverage includes objects with `properties`/`required`/`additionalProperties`, a
 `items`/`prefixItems` and length bounds, `enum`/`const`, `$ref`/`$defs`, `anyOf`, disjoint
 `oneOf`, `allOf`, integer and numeric bounds, `minLength`/`maxLength`, and the `date-time`,
 `date`, `time`, `uri`, and `email` string formats. `json_object` maps to `{"type":"object"}`.
+Type-array unions are also supported; type-specific assertions are enforced only on the compatible union branches, so schemas such as `{"type":["object","null"],"properties":...}` retain their object constraints while allowing `null`.
 
 The constraint applies to the content channel only. On a thinking request, reasoning stays free
 until the model emits `</think>` (or a thinking-budget early close), after which content tokens
